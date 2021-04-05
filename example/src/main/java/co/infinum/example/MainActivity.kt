@@ -9,61 +9,67 @@ import android.media.MediaPlayer
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.support.v4.app.ActivityCompat
-import android.support.v7.app.AlertDialog
-import android.support.v7.app.AppCompatActivity
-import android.support.v7.app.AppCompatDelegate
-import android.support.v7.widget.LinearLayoutManager
 import android.util.Log
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
-import co.infinum.goldeneye.GoldenEye
-import co.infinum.goldeneye.InitCallback
-import co.infinum.goldeneye.Logger
-import co.infinum.goldeneye.config.CameraConfig
-import co.infinum.goldeneye.config.CameraInfo
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.Camera
+import androidx.camera.core.CameraInfoUnavailableException
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.CameraX
+import androidx.camera.core.FocusMeteringAction
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.MeteringPointFactory
+import androidx.camera.core.Preview
+import androidx.camera.core.SurfaceOrientedMeteringPointFactory
+import androidx.camera.core.VideoCapture
+import androidx.camera.core.impl.VideoCaptureConfig
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.recyclerview.widget.LinearLayoutManager
 import kotlinx.android.synthetic.main.activity_main.*
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.math.min
 
-@SuppressLint("SetTextI18n")
+@SuppressLint("SetTextI18n", "RestrictedApi")
 class MainActivity : AppCompatActivity() {
 
+    companion object {
+        private const val TAG = "CameraXBasic"
+        private const val FILENAME_FORMAT = "yyyy-MM-dd-HH-mm-ss-SSS"
+        private const val REQUEST_CODE_PERMISSIONS = 10
+        private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
+    }
+
+    private var configs: CameraXConfig = CameraXConfig()
+    private var videoCapture: VideoCapture? = null
+    private var imageCapture: ImageCapture? = null
+    private var camera: Camera? = null
+
     private val mainHandler = Handler(Looper.getMainLooper())
-    private lateinit var goldenEye: GoldenEye
+
     private lateinit var videoFile: File
     private var isRecording = false
+    private var cameraLensSelector = CameraSelector.DEFAULT_BACK_CAMERA
     private var settingsAdapter = SettingsAdapter(listOf())
-
-    private val initCallback = object : InitCallback() {
-        override fun onReady(config: CameraConfig) {
-            zoomView.text = "Zoom: ${config.zoom.toPercentage()}"
-        }
-
-        override fun onError(t: Throwable) {
-            t.printStackTrace()
-        }
-    }
-
-    private val logger = object : Logger {
-        override fun log(message: String) {
-            Log.e("GoldenEye", message)
-        }
-
-        override fun log(t: Throwable) {
-            t.printStackTrace()
-        }
-    }
+    private var needToRecreateCamera = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-        AppCompatDelegate.setCompatVectorFromResourcesEnabled(true)
-        initGoldenEye()
+
         videoFile = File.createTempFile("vid", "")
         initListeners()
+        setUpZoomAndFocus()
     }
 
     private fun initListeners() {
@@ -77,15 +83,14 @@ class MainActivity : AppCompatActivity() {
         }
 
         takePictureView.setOnClickListener { _ ->
-            goldenEye.takePicture(
+            takePicture(
                 onPictureTaken = { bitmap ->
                     if (bitmap.width <= 4096 && bitmap.height <= 4096) {
                         displayPicture(bitmap)
                     } else {
                         reducePictureSize(bitmap)
                     }
-                },
-                onError = { it.printStackTrace() }
+                }
             )
         }
 
@@ -93,17 +98,41 @@ class MainActivity : AppCompatActivity() {
             if (isRecording) {
                 isRecording = false
                 recordVideoView.setImageResource(R.drawable.ic_record_video)
-                goldenEye.stopRecording()
+                videoCapture?.stopRecording()
             } else {
                 startRecording()
             }
         }
 
         switchCameraView.setOnClickListener { _ ->
-            val currentIndex = goldenEye.availableCameras.indexOfFirst { goldenEye.config?.id == it.id }
-            val nextIndex = (currentIndex + 1) % goldenEye.availableCameras.size
-            openCamera(goldenEye.availableCameras[nextIndex])
+            cameraLensSelector =
+                if (cameraLensSelector == CameraSelector.DEFAULT_BACK_CAMERA) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+            recreateCamera()
         }
+    }
+
+    private fun recreateCamera() {
+        CameraX.unbindAll()
+        startCamera()
+    }
+
+    private fun takePicture(onPictureTaken: (Bitmap) -> Unit) {
+
+        // Setup image capture listener which is triggered after photo has
+        // been taken
+        imageCapture?.takePicture(ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageCapturedCallback() {
+            override fun onError(exc: ImageCaptureException) {
+                Log.e(TAG, "Photo capture failed: ${exc.message}", exc)
+            }
+
+            @SuppressLint("UnsafeExperimentalUsageError")
+            override fun onCaptureSuccess(image: ImageProxy) {
+                image.image?.let {
+                    onPictureTaken(it.toBitmap())
+                }
+                super.onCaptureSuccess(image)
+            }
+        })
     }
 
     private fun reducePictureSize(bitmap: Bitmap) {
@@ -133,31 +162,69 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    private fun initGoldenEye() {
-        goldenEye = GoldenEye.Builder(this)
-            .setLogger(logger)
-            .setOnZoomChangedCallback { zoomView.text = "Zoom: ${it.toPercentage()}" }
-            .build()
-    }
-
     override fun onStart() {
         super.onStart()
-        if (goldenEye.availableCameras.isNotEmpty()) {
-            openCamera(goldenEye.availableCameras[0])
-        }
+        openCamera()
     }
 
     override fun onStop() {
         super.onStop()
-        goldenEye.release()
+        CameraX.unbindAll()
     }
 
-    private fun openCamera(cameraInfo: CameraInfo) {
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-            goldenEye.open(textureView, cameraInfo, initCallback)
+    private fun openCamera() {
+        if (allPermissionsGranted()) {
+            startCamera()
         } else {
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 0x1)
+            ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
         }
+    }
+
+    private fun startCamera() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+
+        cameraProviderFuture.addListener(Runnable {
+            // Used to bind the lifecycle of cameras to the lifecycle owner
+            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+
+            // Preview
+            val previewBuilder = Preview.Builder()
+            val imageCaptureBuilder = ImageCapture.Builder()
+                .setFlashMode(configs.flashMode)
+            val videoCaptureBuilder = VideoCaptureConfig.Builder()
+            if (configs.pictureSize != null) {
+                configs.pictureSize?.let {
+                    previewBuilder.setTargetResolution(it)
+                    imageCaptureBuilder.setTargetResolution(it)
+                    videoCaptureBuilder.setTargetResolution(it)
+                }
+            } else {
+                previewBuilder.setTargetAspectRatio(configs.aspectRatio)
+                imageCaptureBuilder.setTargetAspectRatio(configs.aspectRatio)
+                videoCaptureBuilder.setTargetAspectRatio(configs.aspectRatio)
+            }
+            val preview = previewBuilder.build()
+            imageCapture = imageCaptureBuilder.build()
+            videoCapture = videoCaptureBuilder.build()
+
+            // Select camera lens
+            val cameraSelector = cameraLensSelector
+
+            try {
+                // Unbind use cases before rebindings
+                cameraProvider.unbindAll()
+
+                // Bind use cases to camera
+                camera = cameraProvider.bindToLifecycle(
+                    this, cameraSelector, preview, imageCapture, videoCapture
+                )
+
+                preview.setSurfaceProvider(viewFinder.createSurfaceProvider(camera?.cameraInfo))
+            } catch (exc: Exception) {
+                Log.e(TAG, "Use case binding failed", exc)
+            }
+
+        }, ContextCompat.getMainExecutor(this))
     }
 
     private fun startRecording() {
@@ -171,9 +238,9 @@ class MainActivity : AppCompatActivity() {
     private fun record() {
         isRecording = true
         recordVideoView.setImageResource(R.drawable.ic_stop)
-        goldenEye.startRecording(
-            file = videoFile,
-            onVideoRecorded = {
+
+        videoCapture?.startRecording(videoFile, ContextCompat.getMainExecutor(this), object : VideoCapture.OnVideoSavedCallback {
+            override fun onVideoSaved(file: File) {
                 previewVideoContainer.visibility = View.VISIBLE
                 if (previewVideoView.isAvailable) {
                     startVideo()
@@ -188,46 +255,46 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
                 }
-            },
-            onError = { it.printStackTrace() }
-        )
+            }
+
+            override fun onError(videoCaptureError: Int, message: String, cause: Throwable?) {
+                Log.i(javaClass.simpleName, "Video Error: $message")
+            }
+        })
     }
 
     @SuppressLint("MissingPermission")
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
-        if (requestCode == 0x1) {
-            if (grantResults.getOrNull(0) == PackageManager.PERMISSION_GRANTED) {
-                goldenEye.open(textureView, goldenEye.availableCameras[0], initCallback)
+        if (requestCode == REQUEST_CODE_PERMISSIONS) {
+            if (allPermissionsGranted()) {
+                startCamera()
             } else {
-                AlertDialog.Builder(this)
-                    .setTitle("GoldenEye")
-                    .setMessage("Smartass Detected!")
-                    .setPositiveButton("I am smartass") { _, _ ->
-                        throw SmartassException
-                    }
-                    .setNegativeButton("Sorry") { _, _ ->
-                        openCamera(goldenEye.availableCameras[0])
-                    }
-                    .setCancelable(false)
-                    .show()
+                Toast.makeText(
+                    this,
+                    "Permissions not granted by the user.",
+                    Toast.LENGTH_SHORT
+                ).show()
+                finish()
             }
-        } else if (requestCode == 0x2) {
-            record()
         }
     }
 
     override fun onBackPressed() {
         if (settingsRecyclerView.visibility == View.VISIBLE) {
             settingsRecyclerView.visibility = View.GONE
+            updateSettings()
         } else {
             super.onBackPressed()
         }
     }
 
+    private fun updateSettings() {
+        recreateCamera()
+        setUpZoomAndFocus()
+    }
+
     private fun prepareItems() {
-        goldenEye.config?.apply {
-            prepareItems(this@MainActivity, settingsAdapter)
-        }
+        configs.prepareItems(this, settingsAdapter)
     }
 
     private fun startVideo() {
@@ -256,6 +323,103 @@ class MainActivity : AppCompatActivity() {
             start()
         }
     }
-}
 
-object SmartassException : Throwable()
+    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
+        ContextCompat.checkSelfPermission(
+            baseContext, it
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun setUpPinchToZoom(event: MotionEvent, scaleGestureDetector: ScaleGestureDetector?): Boolean {
+        scaleGestureDetector?.onTouchEvent(event)
+        return true
+    }
+
+    private fun setAutomaticFocus() {
+        viewFinder.afterMeasured {
+            val factory: MeteringPointFactory = SurfaceOrientedMeteringPointFactory(
+                viewFinder.width.toFloat(), viewFinder.height.toFloat()
+            )
+            val centerWidth = viewFinder.width.toFloat() / 2
+            val centerHeight = viewFinder.height.toFloat() / 2
+            //create a point on the center of the view
+            val autoFocusPoint = factory.createPoint(centerWidth, centerHeight)
+            try {
+                camera?.cameraControl?.startFocusAndMetering(
+                    FocusMeteringAction.Builder(
+                        autoFocusPoint,
+                        FocusMeteringAction.FLAG_AF
+                    ).apply {
+                        //auto-focus every 1 seconds
+                        setAutoCancelDuration(1, TimeUnit.SECONDS)
+                    }.build()
+                )
+            } catch (e: CameraInfoUnavailableException) {
+                Log.d("ERROR", "cannot access camera", e)
+            }
+        }
+    }
+
+    private fun setUpTapToFocus(event: MotionEvent): Boolean {
+        return when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
+                true
+            }
+            MotionEvent.ACTION_UP -> {
+                val factory: MeteringPointFactory = SurfaceOrientedMeteringPointFactory(
+                    viewFinder.width.toFloat(), viewFinder.height.toFloat()
+                )
+                val autoFocusPoint = factory.createPoint(event.x, event.y)
+                try {
+                    camera?.cameraControl?.startFocusAndMetering(
+                        FocusMeteringAction.Builder(
+                            autoFocusPoint,
+                            FocusMeteringAction.FLAG_AF
+                        ).apply {
+                            //focus only when the user tap the preview
+                            disableAutoCancel()
+                        }.build()
+                    )
+                } catch (e: CameraInfoUnavailableException) {
+                    Log.d("ERROR", "cannot access camera", e)
+                }
+                true
+            }
+            else -> false // Unhandled event.
+        }
+    }
+
+    fun setUpZoomAndFocus() {
+        var scaleGestureDetector: ScaleGestureDetector? = null
+        if (configs.pinchToZoomEnabled) {
+            val listener = object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                override fun onScale(detector: ScaleGestureDetector): Boolean {
+                    val currentZoomRatio: Float = camera?.cameraInfo?.zoomState?.value?.zoomRatio ?: 0F
+                    val delta = detector.scaleFactor
+                    camera?.cameraControl?.setZoomRatio(currentZoomRatio * delta)
+                    zoomView.text = "Zoom: %.02f".format(currentZoomRatio)
+                    return true
+                }
+            }
+            scaleGestureDetector = ScaleGestureDetector(this, listener)
+        }
+        viewFinder.afterMeasured {
+            viewFinder.setOnTouchListener { _, event ->
+                return@setOnTouchListener when {
+                    configs.pinchToZoomEnabled && configs.focusMode == FOCUS_MODE_TAP -> setUpPinchToZoom(
+                        event,
+                        scaleGestureDetector
+                    ) && setUpTapToFocus(event)
+                    configs.pinchToZoomEnabled -> setUpPinchToZoom(event, scaleGestureDetector)
+                    configs.focusMode == FOCUS_MODE_TAP -> setUpTapToFocus(event)
+                    else -> false
+                }
+            }
+        }
+        if (configs.focusMode == FOCUS_MODE_AUTO) {
+            setAutomaticFocus()
+        } else if (configs.focusMode == FOCUS_MODE_OFF) {
+            camera?.cameraControl?.cancelFocusAndMetering()
+        }
+    }
+}
